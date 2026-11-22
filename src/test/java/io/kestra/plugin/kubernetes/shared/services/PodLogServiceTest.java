@@ -1,10 +1,16 @@
 package io.kestra.plugin.kubernetes.shared.services;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -28,11 +34,15 @@ import io.fabric8.kubernetes.client.dsl.PodResource;
 import io.fabric8.kubernetes.client.dsl.TimestampBytesLimitTerminateTimeTailPrettyLoggable;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @KestraTest
@@ -237,5 +247,180 @@ public class PodLogServiceTest {
         Mockito.verify(logger).warn(contains("no log consumer was set"), eq("test-pod"));
         // it must stay a dead end, just a loud one: no API call is attempted
         Mockito.verifyNoInteractions(client);
+    }
+
+    /*
+     * Regression tests for kestra-io/plugin-kubernetes#237.
+     *
+     * close() used to return while the scheduled tick was between the `closing` check and the
+     * registration of its watch, so that watch landed in a list nobody drained any more: it kept
+     * the KubernetesClient reachable after PodCreate's try-with-resources had closed the client.
+     */
+
+    private record LogCall(KubernetesClient client, Pod pod, RunContext runContext,
+                           AbstractLogConsumer consumer) {
+    }
+
+    private static LogCall logCall(TimestampBytesLimitTerminateTimeTailPrettyLoggable logBuilder) {
+        KubernetesClient client = mock(KubernetesClient.class);
+        Pod pod = mock(Pod.class);
+        PodSpec spec = mock(PodSpec.class);
+        Container container = mock(Container.class);
+
+        when(container.getName()).thenReturn("main");
+        when(pod.getSpec()).thenReturn(spec);
+        when(spec.getContainers()).thenReturn(List.of(container));
+        when(pod.getMetadata()).thenReturn(
+            new ObjectMetaBuilder().withNamespace("default").withName("test-pod").build()
+        );
+
+        @SuppressWarnings("unchecked")
+        MixedOperation<Pod, PodList, PodResource> podsOp = mock(MixedOperation.class);
+        @SuppressWarnings("unchecked")
+        NonNamespaceOperation<Pod, PodList, PodResource> nsOp = mock(NonNamespaceOperation.class);
+        PodResource podResource = mock(PodResource.class);
+
+        when(client.pods()).thenReturn(podsOp);
+        when(podsOp.inNamespace("default")).thenReturn(nsOp);
+        when(nsOp.withName("test-pod")).thenReturn(podResource);
+
+        var containerResource = mock(ContainerResource.class);
+        when(podResource.inContainer("main")).thenReturn(containerResource);
+        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
+        when(containerResource.usingTimestamps()).thenReturn(logBuilder);
+        when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
+
+        RunContext runContext = mock(RunContext.class);
+        when(runContext.logger()).thenReturn(mock(Logger.class));
+
+        return new LogCall(client, pod, runContext, mock(AbstractLogConsumer.class));
+    }
+
+    /** A log request that blocks until released, i.e. the tick is mid-round-trip when close() runs. */
+    private static LogCall blockedLogCall(CountDownLatch entered, CountDownLatch release, List<LogWatch> watches) {
+        var logBuilder = mock(TimestampBytesLimitTerminateTimeTailPrettyLoggable.class);
+        when(logBuilder.watchLog(any())).thenAnswer(invocation ->
+        {
+            entered.countDown();
+            while (release.getCount() > 0) {
+                try {
+                    release.await();
+                } catch (InterruptedException ignored) {
+                    // the real request is not abandoned on interrupt either
+                }
+            }
+            LogWatch watch = mock(LogWatch.class);
+            watches.add(watch);
+            return watch;
+        });
+        return logCall(logBuilder);
+    }
+
+    private static PodLogService startWatching(LogCall call, long refreshInterval) {
+        PodLogService svc = new PodLogService();
+        svc.setRefreshInterval(refreshInterval);
+        svc.watch(call.client(), call.pod(), call.consumer(), call.runContext(), "main");
+        return svc;
+    }
+
+    private static Thread closeInBackground(PodLogService svc) {
+        Thread closer = new Thread(() ->
+        {
+            try {
+                svc.close();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }, "pod-log-closer");
+        closer.start();
+        return closer;
+    }
+
+    /**
+     * Blocks until close() is parked in awaitTermination(), i.e. the closing flag is set and the
+     * tick's registration really takes the late-register branch. Falls through if close() never
+     * waits at all, so a regression fails on the assertion below rather than on this helper.
+     */
+    private static void awaitCloseProgress(Thread closer) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline && closer.isAlive()) {
+            if (Arrays.stream(closer.getStackTrace())
+                .anyMatch(element -> "awaitTermination".equals(element.getMethodName()))) {
+                return;
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    private static long liveLogThreads() {
+        return Thread.getAllStackTraces().keySet().stream()
+            .filter(t -> t.isAlive() && t.getName().startsWith("k8s-log"))
+            .count();
+    }
+
+    /** A pool can report terminated while its thread is still unwinding, so poll to a deadline. */
+    private static void awaitNoLogThreads(long baseline) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (liveLogThreads() > baseline && System.nanoTime() < deadline) {
+            Thread.sleep(25);
+        }
+        assertEquals(baseline, liveLogThreads(), "k8s-log threads survived close()");
+    }
+
+    @Test
+    void closeWaitsForTheInFlightTick() throws Exception {
+        long baseline = liveLogThreads();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        List<LogWatch> watches = new CopyOnWriteArrayList<>();
+        PodLogService svc = startWatching(blockedLogCall(entered, release, watches), 3600);
+
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "scheduled tick never reached watchLog()");
+
+        Thread closer = closeInBackground(svc);
+        try {
+            awaitCloseProgress(closer);
+            assertTrue(closer.isAlive(), "close() returned while the tick was still inside the log request");
+
+            release.countDown();
+            closer.join(TimeUnit.SECONDS.toMillis(10));
+            assertFalse(closer.isAlive(), "close() did not return once the tick finished");
+
+            awaitNoLogThreads(baseline);
+        } finally {
+            release.countDown();
+            closer.interrupt();
+        }
+    }
+
+    private static void awaitWatch(List<LogWatch> watches) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (watches.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+    }
+
+    @Test
+    void watchRegisteredWhileClosingIsClosed() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        List<LogWatch> watches = new CopyOnWriteArrayList<>();
+        PodLogService svc = startWatching(blockedLogCall(entered, release, watches), 3600);
+
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "scheduled tick never reached watchLog()");
+
+        Thread closer = closeInBackground(svc);
+        try {
+            awaitCloseProgress(closer);
+            release.countDown();
+            closer.join(TimeUnit.SECONDS.toMillis(10));
+            awaitWatch(watches);
+
+            assertFalse(watches.isEmpty(), "expected the in-flight tick to create one log watch");
+            verify(watches.get(0)).close();
+        } finally {
+            release.countDown();
+            closer.interrupt();
+        }
     }
 }

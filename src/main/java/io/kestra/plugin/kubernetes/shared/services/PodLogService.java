@@ -24,11 +24,7 @@ import lombok.Getter;
 import org.slf4j.Logger;
 
 public class PodLogService implements AutoCloseable {
-    /**
-     * Budget for the scheduled tick to unwind before the caller is allowed to close the
-     * KubernetesClient. A tick can be blocked inside a fabric8 log read that ignores interrupts,
-     * so this bounds how long {@link #close()} waits rather than waiting forever.
-     */
+    // Bounds how long close() waits for an in-flight tick before the caller may close the client.
     private static final long TERMINATION_TIMEOUT_SECONDS = 10;
 
     // Guarded by podLogsLock: the scheduled tick adds watches while close() drains them.
@@ -116,8 +112,8 @@ public class PodLogService implements AutoCloseable {
                     lastReconnection.set(Instant.now(clock));
 
                     if (closing.get()) {
-                        // close() already drained the watches: stop here instead of opening a
-                        // stream nobody will ever close (it would keep holding the client).
+                        // close() already drained the watches: a watch opened here would never be
+                        // closed and would outlive the client.
                         return;
                     }
                     closePodLogs();
@@ -305,20 +301,21 @@ public class PodLogService implements AutoCloseable {
             }
         }
 
-        // Closing the watches unblocks a tick that is stuck inside a log read: an interrupt alone
-        // does not wake fabric8's blocking stream.
-        closePodLogs();
-
         if (scheduledExecutor != null) {
             scheduledExecutor.shutdownNow();
-            // A tick may still be inside a client call. Returning while it runs lets the caller
-            // close the KubernetesClient underneath an open stream, which leaks the request
-            // (and its threads) past the end of the task.
-            awaitTermination();
+            // A tick can still be inside the log request itself; wait for it so the caller's
+            // try-with-resources does not close the client underneath an open request.
+            try {
+                if (!scheduledExecutor.awaitTermination(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    logger.warn("Log collection executor did not terminate within {}s", TERMINATION_TIMEOUT_SECONDS);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
 
-        // Drain anything a tick registered after the first pass: registerPodLog() closes late
-        // watches itself, so this is a belt-and-braces sweep for the window in between.
+        // Nothing can register once closing is set (registerPodLog() closes late watches itself),
+        // so a single drain after the tick is done closes every watch that reached the list.
         closePodLogs();
 
         if (thread != null) {
@@ -334,8 +331,8 @@ public class PodLogService implements AutoCloseable {
                 return;
             }
         }
-        // The service is closing: nobody will ever drain this watch, so close it right away.
-        closeQuietly(watch);
+        // The service is closing: nobody will drain this watch, so close it right here.
+        watch.close();
     }
 
     private void closePodLogs() {
@@ -347,32 +344,6 @@ public class PodLogService implements AutoCloseable {
             toClose = new ArrayList<>(podLogs);
             podLogs.clear();
         }
-        toClose.forEach(PodLogService::closeQuietly);
-    }
-
-    private static void closeQuietly(LogWatch watch) {
-        try {
-            watch.close();
-        } catch (Exception ignored) {
-            // best-effort: a watch on an already-closed client throws
-        }
-    }
-
-    private void awaitTermination() {
-        if (scheduledExecutor == null) {
-            return;
-        }
-        try {
-            if (!scheduledExecutor.awaitTermination(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                && logger != null) {
-                logger.warn(
-                    "Log collection executor did not terminate within {}s; the Kubernetes client may be " +
-                        "closed while a log stream is still open",
-                    TERMINATION_TIMEOUT_SECONDS
-                );
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        toClose.forEach(LogWatch::close);
     }
 }
