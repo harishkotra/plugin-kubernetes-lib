@@ -112,8 +112,6 @@ public class PodLogService implements AutoCloseable {
                     lastReconnection.set(Instant.now(clock));
 
                     if (closing.get()) {
-                        // close() already drained the watches: a watch opened here would never be
-                        // closed and would outlive the client.
                         return;
                     }
                     closePodLogs();
@@ -303,8 +301,7 @@ public class PodLogService implements AutoCloseable {
 
         if (scheduledExecutor != null) {
             scheduledExecutor.shutdownNow();
-            // A tick can still be inside the log request itself; wait for it so the caller's
-            // try-with-resources does not close the client underneath an open request.
+            // Let an in-flight tick finish registering its watch before the drain below.
             try {
                 if (!scheduledExecutor.awaitTermination(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                     logger.warn("Log collection executor did not terminate within {}s", TERMINATION_TIMEOUT_SECONDS);
@@ -314,8 +311,7 @@ public class PodLogService implements AutoCloseable {
             }
         }
 
-        // Nothing can register once closing is set (registerPodLog() closes late watches itself),
-        // so a single drain after the tick is done closes every watch that reached the list.
+        // A watch registered after this drain is closed by registerPodLog() itself.
         closePodLogs();
 
         if (thread != null) {
@@ -338,9 +334,6 @@ public class PodLogService implements AutoCloseable {
     private void closePodLogs() {
         List<LogWatch> toClose;
         synchronized (podLogsLock) {
-            if (podLogs.isEmpty()) {
-                return;
-            }
             toClose = new ArrayList<>(podLogs);
             podLogs.clear();
         }

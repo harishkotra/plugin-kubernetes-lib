@@ -49,58 +49,19 @@ import static org.mockito.Mockito.when;
 public class PodLogServiceTest {
     @Test
     void reconnectsAfterThreeHours() throws Exception {
-        // --- Arrange ---
-        KubernetesClient client = mock(KubernetesClient.class);
-        Pod pod = mock(Pod.class);
-        PodSpec spec = mock(PodSpec.class);
-        Container container = mock(Container.class);
-
-        when(container.getName()).thenReturn("main");
-        when(pod.getSpec()).thenReturn(spec);
-        when(spec.getContainers()).thenReturn(List.of(container));
-        when(pod.getMetadata()).thenReturn(
-            new ObjectMetaBuilder().withNamespace("default").withName("test-pod").build()
-        );
-
-        // Mock Kubernetes client chain
-        @SuppressWarnings("unchecked")
-        MixedOperation<Pod, PodList, PodResource> podsOp = mock(MixedOperation.class);
-        @SuppressWarnings("unchecked")
-        NonNamespaceOperation<Pod, PodList, PodResource> nsOp = mock(NonNamespaceOperation.class);
-        PodResource podResource = mock(PodResource.class);
-
-        when(client.pods()).thenReturn(podsOp);
-        when(podsOp.inNamespace("default")).thenReturn(nsOp);
-        when(nsOp.withName("test-pod")).thenReturn(podResource);
-        when(podResource.get()).thenReturn(pod);
-
-        // Mock log watching
-        var containerResource = mock(ContainerResource.class);
         var logBuilder = mock(TimestampBytesLimitTerminateTimeTailPrettyLoggable.class);
-        var logWatch = mock(LogWatch.class);
+        when(logBuilder.watchLog(any())).thenReturn(mock(LogWatch.class));
+        var call = logCall(logBuilder);
 
-        when(podResource.inContainer("main")).thenReturn(containerResource);
-        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
-        when(containerResource.usingTimestamps()).thenReturn(logBuilder);
-        when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
-        when(logBuilder.watchLog(any())).thenReturn(logWatch);
-
-        RunContext runContext = mock(RunContext.class);
-        when(runContext.logger()).thenReturn(mock(Logger.class));
-        AbstractLogConsumer logConsumer = mock(AbstractLogConsumer.class);
-
-        // Mock Clock
-        Clock clock = mock(Clock.class);
-        Instant startTime = Instant.parse("2023-01-01T00:00:00Z");
+        var clock = mock(Clock.class);
+        var startTime = Instant.parse("2023-01-01T00:00:00Z");
         when(clock.instant()).thenReturn(startTime);
         when(clock.getZone()).thenReturn(java.time.ZoneId.of("UTC"));
 
-        PodLogService svc = new PodLogService();
+        var svc = new PodLogService();
         svc.setClock(clock);
-        svc.setRefreshInterval(1); // Set refresh interval to 1 second for faster testing
-
-        // --- Act ---
-        svc.watch(client, pod, logConsumer, runContext, container.getName());
+        svc.setRefreshInterval(1);
+        svc.watch(call.client(), call.pod(), call.consumer(), call.runContext(), "main");
 
         // Wait for initial connection (immediate execution)
         Thread.sleep(200);
@@ -121,48 +82,12 @@ public class PodLogServiceTest {
 
     @Test
     void doesNotSpamReconnectTraceWhenNoNewLogsArrive() throws Exception {
-        KubernetesClient client = mock(KubernetesClient.class);
-        Pod pod = mock(Pod.class);
-        PodSpec spec = mock(PodSpec.class);
-        Container container = mock(Container.class);
-
-        when(container.getName()).thenReturn("main");
-        when(pod.getSpec()).thenReturn(spec);
-        when(spec.getContainers()).thenReturn(List.of(container));
-        when(pod.getMetadata()).thenReturn(
-            new ObjectMetaBuilder().withNamespace("default").withName("test-pod").build()
-        );
-
-        @SuppressWarnings("unchecked")
-        MixedOperation<Pod, PodList, PodResource> podsOp = mock(MixedOperation.class);
-        @SuppressWarnings("unchecked")
-        NonNamespaceOperation<Pod, PodList, PodResource> nsOp = mock(NonNamespaceOperation.class);
-        PodResource podResource = mock(PodResource.class);
-
-        when(client.pods()).thenReturn(podsOp);
-        when(podsOp.inNamespace("default")).thenReturn(nsOp);
-        when(nsOp.withName("test-pod")).thenReturn(podResource);
-        when(podResource.get()).thenReturn(pod);
-
-        var containerResource = mock(ContainerResource.class);
         var logBuilder = mock(TimestampBytesLimitTerminateTimeTailPrettyLoggable.class);
-        var logWatch = mock(LogWatch.class);
+        when(logBuilder.watchLog(any())).thenReturn(mock(LogWatch.class));
+        var call = logCall(logBuilder);
+        var logger = call.runContext().logger();
 
-        when(podResource.inContainer("main")).thenReturn(containerResource);
-        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
-        when(containerResource.usingTimestamps()).thenReturn(logBuilder);
-        when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
-        when(logBuilder.watchLog(any())).thenReturn(logWatch);
-
-        RunContext runContext = mock(RunContext.class);
-        Logger logger = mock(Logger.class);
-        when(runContext.logger()).thenReturn(logger);
-        AbstractLogConsumer logConsumer = mock(AbstractLogConsumer.class);
-
-        PodLogService svc = new PodLogService();
-        svc.setRefreshInterval(1);
-
-        svc.watch(client, pod, logConsumer, runContext, container.getName());
+        var svc = startWatching(call, 1);
 
         Thread.sleep(2400);
 
@@ -174,48 +99,12 @@ public class PodLogServiceTest {
 
     @Test
     void closeDoesNotLogCancellationNoise() throws Exception {
-        KubernetesClient client = mock(KubernetesClient.class);
-        Pod pod = mock(Pod.class);
-        PodSpec spec = mock(PodSpec.class);
-        Container container = mock(Container.class);
-
-        when(container.getName()).thenReturn("main");
-        when(pod.getSpec()).thenReturn(spec);
-        when(spec.getContainers()).thenReturn(List.of(container));
-        when(pod.getMetadata()).thenReturn(
-            new ObjectMetaBuilder().withNamespace("default").withName("test-pod").build()
-        );
-
-        @SuppressWarnings("unchecked")
-        MixedOperation<Pod, PodList, PodResource> podsOp = mock(MixedOperation.class);
-        @SuppressWarnings("unchecked")
-        NonNamespaceOperation<Pod, PodList, PodResource> nsOp = mock(NonNamespaceOperation.class);
-        PodResource podResource = mock(PodResource.class);
-
-        when(client.pods()).thenReturn(podsOp);
-        when(podsOp.inNamespace("default")).thenReturn(nsOp);
-        when(nsOp.withName("test-pod")).thenReturn(podResource);
-        when(podResource.get()).thenReturn(pod);
-
-        var containerResource = mock(ContainerResource.class);
         var logBuilder = mock(TimestampBytesLimitTerminateTimeTailPrettyLoggable.class);
-        var logWatch = mock(LogWatch.class);
+        when(logBuilder.watchLog(any())).thenReturn(mock(LogWatch.class));
+        var call = logCall(logBuilder);
+        var logger = call.runContext().logger();
 
-        when(podResource.inContainer("main")).thenReturn(containerResource);
-        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
-        when(containerResource.usingTimestamps()).thenReturn(logBuilder);
-        when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
-        when(logBuilder.watchLog(any())).thenReturn(logWatch);
-
-        RunContext runContext = mock(RunContext.class);
-        Logger logger = mock(Logger.class);
-        when(runContext.logger()).thenReturn(logger);
-        AbstractLogConsumer logConsumer = mock(AbstractLogConsumer.class);
-
-        PodLogService svc = new PodLogService();
-        svc.setRefreshInterval(1);
-
-        svc.watch(client, pod, logConsumer, runContext, container.getName());
+        var svc = startWatching(call, 1);
         Thread.sleep(200);
         svc.close();
         Thread.sleep(200);
@@ -227,8 +116,8 @@ public class PodLogServiceTest {
 
     @Test
     void fetchFinalLogsWarnsWhenNoLogConsumerIsSet() {
-        KubernetesClient client = mock(KubernetesClient.class);
-        Pod pod = mock(Pod.class);
+        var client = mock(KubernetesClient.class);
+        var pod = mock(Pod.class);
 
         when(pod.getMetadata()).thenReturn(
             new ObjectMetaBuilder().withNamespace("default").withName("test-pod").build()
@@ -249,23 +138,17 @@ public class PodLogServiceTest {
         Mockito.verifyNoInteractions(client);
     }
 
-    /*
-     * Regression tests for kestra-io/plugin-kubernetes#237.
-     *
-     * close() used to return while the scheduled tick was between the `closing` check and the
-     * registration of its watch, so that watch landed in a list nobody drained any more: it kept
-     * the KubernetesClient reachable after PodCreate's try-with-resources had closed the client.
-     */
+    // Regression tests for kestra-io/plugin-kubernetes#237.
 
     private record LogCall(KubernetesClient client, Pod pod, RunContext runContext,
                            AbstractLogConsumer consumer) {
     }
 
     private static LogCall logCall(TimestampBytesLimitTerminateTimeTailPrettyLoggable logBuilder) {
-        KubernetesClient client = mock(KubernetesClient.class);
-        Pod pod = mock(Pod.class);
-        PodSpec spec = mock(PodSpec.class);
-        Container container = mock(Container.class);
+        var client = mock(KubernetesClient.class);
+        var pod = mock(Pod.class);
+        var spec = mock(PodSpec.class);
+        var container = mock(Container.class);
 
         when(container.getName()).thenReturn("main");
         when(pod.getSpec()).thenReturn(spec);
@@ -278,11 +161,12 @@ public class PodLogServiceTest {
         MixedOperation<Pod, PodList, PodResource> podsOp = mock(MixedOperation.class);
         @SuppressWarnings("unchecked")
         NonNamespaceOperation<Pod, PodList, PodResource> nsOp = mock(NonNamespaceOperation.class);
-        PodResource podResource = mock(PodResource.class);
+        var podResource = mock(PodResource.class);
 
         when(client.pods()).thenReturn(podsOp);
         when(podsOp.inNamespace("default")).thenReturn(nsOp);
         when(nsOp.withName("test-pod")).thenReturn(podResource);
+        when(podResource.get()).thenReturn(pod);
 
         var containerResource = mock(ContainerResource.class);
         when(podResource.inContainer("main")).thenReturn(containerResource);
@@ -290,13 +174,13 @@ public class PodLogServiceTest {
         when(containerResource.usingTimestamps()).thenReturn(logBuilder);
         when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
 
-        RunContext runContext = mock(RunContext.class);
+        var runContext = mock(RunContext.class);
         when(runContext.logger()).thenReturn(mock(Logger.class));
 
         return new LogCall(client, pod, runContext, mock(AbstractLogConsumer.class));
     }
 
-    /** A log request that blocks until released, i.e. the tick is mid-round-trip when close() runs. */
+    // A log request that blocks until released, so the tick is mid-request when close() runs.
     private static LogCall blockedLogCall(CountDownLatch entered, CountDownLatch release, List<LogWatch> watches) {
         var logBuilder = mock(TimestampBytesLimitTerminateTimeTailPrettyLoggable.class);
         when(logBuilder.watchLog(any())).thenAnswer(invocation ->
@@ -309,7 +193,7 @@ public class PodLogServiceTest {
                     // the real request is not abandoned on interrupt either
                 }
             }
-            LogWatch watch = mock(LogWatch.class);
+            var watch = mock(LogWatch.class);
             watches.add(watch);
             return watch;
         });
@@ -317,14 +201,14 @@ public class PodLogServiceTest {
     }
 
     private static PodLogService startWatching(LogCall call, long refreshInterval) {
-        PodLogService svc = new PodLogService();
+        var svc = new PodLogService();
         svc.setRefreshInterval(refreshInterval);
         svc.watch(call.client(), call.pod(), call.consumer(), call.runContext(), "main");
         return svc;
     }
 
     private static Thread closeInBackground(PodLogService svc) {
-        Thread closer = new Thread(() ->
+        var closer = new Thread(() ->
         {
             try {
                 svc.close();
@@ -336,13 +220,9 @@ public class PodLogServiceTest {
         return closer;
     }
 
-    /**
-     * Blocks until close() is parked in awaitTermination(), i.e. the closing flag is set and the
-     * tick's registration really takes the late-register branch. Falls through if close() never
-     * waits at all, so a regression fails on the assertion below rather than on this helper.
-     */
+    // Waits until close() is parked in awaitTermination(), so the tick takes the late-register branch.
     private static void awaitCloseProgress(Thread closer) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline && closer.isAlive()) {
             if (Arrays.stream(closer.getStackTrace())
                 .anyMatch(element -> "awaitTermination".equals(element.getMethodName()))) {
@@ -358,9 +238,9 @@ public class PodLogServiceTest {
             .count();
     }
 
-    /** A pool can report terminated while its thread is still unwinding, so poll to a deadline. */
+    // A pool can report terminated while its thread is still unwinding, so poll to a deadline.
     private static void awaitNoLogThreads(long baseline) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (liveLogThreads() > baseline && System.nanoTime() < deadline) {
             Thread.sleep(25);
         }
@@ -369,15 +249,15 @@ public class PodLogServiceTest {
 
     @Test
     void closeWaitsForTheInFlightTick() throws Exception {
-        long baseline = liveLogThreads();
+        var baseline = liveLogThreads();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        List<LogWatch> watches = new CopyOnWriteArrayList<>();
-        PodLogService svc = startWatching(blockedLogCall(entered, release, watches), 3600);
+        var watches = new CopyOnWriteArrayList<LogWatch>();
+        var svc = startWatching(blockedLogCall(entered, release, watches), 3600);
 
         assertTrue(entered.await(5, TimeUnit.SECONDS), "scheduled tick never reached watchLog()");
 
-        Thread closer = closeInBackground(svc);
+        var closer = closeInBackground(svc);
         try {
             awaitCloseProgress(closer);
             assertTrue(closer.isAlive(), "close() returned while the tick was still inside the log request");
@@ -394,7 +274,7 @@ public class PodLogServiceTest {
     }
 
     private static void awaitWatch(List<LogWatch> watches) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (watches.isEmpty() && System.nanoTime() < deadline) {
             Thread.sleep(1);
         }
@@ -404,12 +284,12 @@ public class PodLogServiceTest {
     void watchRegisteredWhileClosingIsClosed() throws Exception {
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        List<LogWatch> watches = new CopyOnWriteArrayList<>();
-        PodLogService svc = startWatching(blockedLogCall(entered, release, watches), 3600);
+        var watches = new CopyOnWriteArrayList<LogWatch>();
+        var svc = startWatching(blockedLogCall(entered, release, watches), 3600);
 
         assertTrue(entered.await(5, TimeUnit.SECONDS), "scheduled tick never reached watchLog()");
 
-        Thread closer = closeInBackground(svc);
+        var closer = closeInBackground(svc);
         try {
             awaitCloseProgress(closer);
             release.countDown();
@@ -417,7 +297,7 @@ public class PodLogServiceTest {
             awaitWatch(watches);
 
             assertFalse(watches.isEmpty(), "expected the in-flight tick to create one log watch");
-            verify(watches.get(0)).close();
+            verify(watches.getFirst()).close();
         } finally {
             release.countDown();
             closer.interrupt();
